@@ -1,0 +1,95 @@
+name: Shopify Subscription Deep Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_file:
+        description: "CSV filename in repo (default: SKU Subscription Data.csv)"
+        required: false
+        default: "SKU Subscription Data.csv"
+      threads:
+        description: "Threads per runner (default: 5)"
+        required: false
+        default: "5"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # 10 parallel scan jobs (Chunk 0 to 9)
+  # ─────────────────────────────────────────────────────────────
+  scan:
+    name: "Scan Chunk ${{ matrix.chunk }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360        # 6 hours max per runner
+    strategy:
+      fail-fast: false           # Don't cancel others if one fails
+      matrix:
+        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install requests pandas tqdm beautifulsoup4 openpyxl lxml
+
+      - name: Run scanner (chunk ${{ matrix.chunk }} of 10)
+        env:
+          INPUT_FILE:  ${{ github.event.inputs.input_file }}
+          OUTPUT_FILE: "output_chunk_${{ matrix.chunk }}.xlsx"
+          THREADS:     ${{ github.event.inputs.threads }}
+          CHUNK_INDEX: ${{ matrix.chunk }}
+          CHUNK_TOTAL: "10"
+        run: |
+          python shopify_deep_scanner.py
+
+      - name: Upload chunk result
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: "chunk-${{ matrix.chunk }}"
+          path: "output_chunk_${{ matrix.chunk }}.xlsx"
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────
+  # Merge all 10 chunks into one final Excel
+  # ─────────────────────────────────────────────────────────────
+  merge:
+    name: "Merge All Chunks"
+    runs-on: ubuntu-latest
+    needs: scan
+    if: always()
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pandas openpyxl
+
+      - name: Download all chunk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./chunks/
+          merge-multiple: true      # puts all files in ./chunks/
+
+      - name: Merge chunks into final Excel
+        run: |
+          python merge_chunks.py
+
+      - name: Upload final merged result
+        uses: actions/upload-artifact@v4
+        with:
+          name: "FINAL_Shopify_Deep_Analysis"
+          path: "FINAL_Shopify_Deep_Analysis.xlsx"
+          retention-days: 30
