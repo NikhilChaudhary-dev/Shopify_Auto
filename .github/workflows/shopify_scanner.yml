@@ -8,12 +8,11 @@ on:
         required: false
         default: "SKU Subscription Data.csv"
       threads:
-        description: "Threads per runner (default: 5)"
+        description: "Threads per runner (default: 3)"
         required: false
-        default: "5"
+        default: "3"
 
 jobs:
-  # ── 20 parallel scan jobs ─────────────────────────────────
   scan:
     name: "Scan Chunk ${{ matrix.chunk }}"
     runs-on: ubuntu-latest
@@ -32,10 +31,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Python packages
         run: pip install playwright pandas tqdm openpyxl
-          python -m playwright install chromium
-          python -m playwright install-deps chromium
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install chromium
+
+      - name: Install Playwright system deps
+        run: python -m playwright install-deps chromium
 
       - name: Run scanner
         env:
@@ -48,18 +51,17 @@ jobs:
 
       - name: Upload chunk result
         uses: actions/upload-artifact@v4
-        if: always()   # fail hone pe bhi upload karo
+        if: always()
         with:
           name: "chunk-${{ matrix.chunk }}"
           path: "output_chunk_${{ matrix.chunk }}.xlsx"
           retention-days: 7
 
-  # ── Merge job ─────────────────────────────────────────────
   merge:
     name: "Merge All Chunks"
     runs-on: ubuntu-latest
     needs: scan
-    if: always()   # scan fail ho tab bhi merge karo
+    if: always()
 
     steps:
       - name: Checkout repo
@@ -79,11 +81,8 @@ jobs:
           path: ./chunks/
           merge-multiple: true
 
-      - name: List downloaded files (debug)
-        run: |
-          echo "=== Files in ./chunks/ ==="
-          find ./chunks -name "*.xlsx" | sort
-          echo "=========================="
+      - name: List downloaded files
+        run: find ./chunks -name "*.xlsx" | sort
 
       - name: Merge chunks
         run: python merge_chunks.py
