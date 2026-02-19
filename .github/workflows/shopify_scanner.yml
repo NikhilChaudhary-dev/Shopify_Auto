@@ -33,7 +33,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests pandas tqdm beautifulsoup4 openpyxl lxml cloudscraper
+        run: pip install playwright pandas tqdm openpyxl
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
 
       - name: Run scanner
         env:
