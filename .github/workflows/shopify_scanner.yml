@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       input_file:
-        description: "CSV filename in repo (default: SKU Subscription Data.csv)"
+        description: "CSV filename in repo"
         required: false
         default: "SKU Subscription Data.csv"
       threads:
@@ -13,17 +13,15 @@ on:
         default: "5"
 
 jobs:
-  # ─────────────────────────────────────────────────────────────
-  # 10 parallel scan jobs (Chunk 0 to 9)
-  # ─────────────────────────────────────────────────────────────
+  # ── 20 parallel scan jobs ─────────────────────────────────
   scan:
     name: "Scan Chunk ${{ matrix.chunk }}"
     runs-on: ubuntu-latest
-    timeout-minutes: 360        # 6 hours max per runner
+    timeout-minutes: 360
     strategy:
-      fail-fast: false           # Don't cancel others if one fails
+      fail-fast: false
       matrix:
-        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        chunk: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
 
     steps:
       - name: Checkout repo
@@ -35,35 +33,31 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          pip install requests pandas tqdm beautifulsoup4 openpyxl lxml
+        run: pip install requests pandas tqdm beautifulsoup4 openpyxl lxml cloudscraper
 
-      - name: Run scanner (chunk ${{ matrix.chunk }} of 20)
+      - name: Run scanner
         env:
           INPUT_FILE:  ${{ github.event.inputs.input_file }}
           OUTPUT_FILE: "output_chunk_${{ matrix.chunk }}.xlsx"
           THREADS:     ${{ github.event.inputs.threads }}
           CHUNK_INDEX: ${{ matrix.chunk }}
           CHUNK_TOTAL: "20"
-        run: |
-          python shopify_deep_scanner.py
+        run: python shopify_deep_scanner.py
 
       - name: Upload chunk result
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always()   # fail hone pe bhi upload karo
         with:
           name: "chunk-${{ matrix.chunk }}"
           path: "output_chunk_${{ matrix.chunk }}.xlsx"
           retention-days: 7
 
-  # ─────────────────────────────────────────────────────────────
-  # Merge all 10 chunks into one final Excel
-  # ─────────────────────────────────────────────────────────────
+  # ── Merge job ─────────────────────────────────────────────
   merge:
     name: "Merge All Chunks"
     runs-on: ubuntu-latest
     needs: scan
-    if: always()
+    if: always()   # scan fail ho tab bhi merge karo
 
     steps:
       - name: Checkout repo
@@ -81,14 +75,20 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: ./chunks/
-          merge-multiple: true      # puts all files in ./chunks/
+          merge-multiple: true
 
-      - name: Merge chunks into final Excel
+      - name: List downloaded files (debug)
         run: |
-          python merge_chunks.py
+          echo "=== Files in ./chunks/ ==="
+          find ./chunks -name "*.xlsx" | sort
+          echo "=========================="
 
-      - name: Upload final merged result
+      - name: Merge chunks
+        run: python merge_chunks.py
+
+      - name: Upload final result
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: "FINAL_Shopify_Deep_Analysis"
           path: "FINAL_Shopify_Deep_Analysis.xlsx"
