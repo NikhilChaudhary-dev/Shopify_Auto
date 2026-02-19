@@ -1,12 +1,14 @@
 """
-Shopify Subscription Extractor - Fixed Version
-- JSON parse errors handle karo
-- Homepage se app detect karo
-- selling_plan_groups se products
-- CloudScraper + 20 chunks
+Shopify Subscription Extractor - Playwright Version
+- Real Chromium browser = Cloudflare 100% bypass
+- Homepage se app detect
+- selling_plan_groups se products  
+- GitHub Actions: 20 chunks
 """
 
-import cloudscraper
+import asyncio
+import re
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -17,8 +19,8 @@ import os
 
 INPUT_FILE  = os.getenv("INPUT_FILE", "SKU Subscription Data.csv")
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "Shopify_Subscription_Deep_Analysis.xlsx")
-THREADS     = int(os.getenv("THREADS", "5"))
-TIMEOUT     = (5, 15)
+THREADS     = int(os.getenv("THREADS", "3"))
+TIMEOUT     = 20000
 CHUNK_INDEX = int(os.getenv("CHUNK_INDEX", "0"))
 CHUNK_TOTAL = int(os.getenv("CHUNK_TOTAL", "1"))
 
@@ -46,186 +48,189 @@ APP_SIGNATURES = [
     ("Upscribe",         ["upscribe-widget", "/a/upscribe/", "data-upscribe-id"]),
     ("Growave",          ["growave-sub-widget", "/apps/growave/", "data-growave-id"]),
     ("Yotpo",            ["yotpo-sub-widget", "/apps/yotpo/", "data-yotpo-id"]),
-    ("Rebuy",            ["rebuy-sub-widget", "/apps/rebuy/", "data-rebuy-id", "rebuyengine.com"]),
+    ("Rebuy",            ["rebuy-sub-widget", "/apps/rebuy/", "data-rebuy-id"]),
     ("Vitals",           ["vitals-sub-widget", "/apps/vitals/", "data-vitals-id"]),
     ("QPilot",           ["qpilot-widget", "/apps/qpilot/", "data-qpilot-id"]),
     ("Subflow",          ["subflow-widget", "/a/subflow/", "data-subflow-id"]),
     ("Kaching",          ["kaching-widget", "/a/kaching/", "data-kaching-id"]),
-    ("Skio",             ["skio-plan-picker", "/a/skio/", "skio.com"]),
     ("EasySub",          ["easysub-widget", "/a/easysub/", "data-easysub-id"]),
+    ("Ongoing Recurring",["recurring-ongoing", "/apps/ongoing-recurring/", "data-recurring-id"]),
+    ("Simple Recurring", ["simple-recurring-id", "/apps/simple-recurring/", "data-recurring-plan"]),
     ("Native Shopify",   ["selling_plan_groups", "selling_plan_id"]),
 ]
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-]
-
-def make_scraper():
-    s = cloudscraper.create_scraper(
-        browser={'browser': 'chrome', 'platform': random.choice(['windows','darwin','linux']), 'mobile': False}
-    )
-    s.headers.update({
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-    })
-    return s
-
-def detect_app(html: str) -> str:
-    html_lower = html.lower()
+def detect_app(html):
+    h = html.lower()
     detected = []
-    for app_name, keywords in APP_SIGNATURES:
-        for kw in keywords:
-            if kw.lower() in html_lower:
-                detected.append(app_name)
+    for name, kws in APP_SIGNATURES:
+        for kw in kws:
+            if kw.lower() in h:
+                detected.append(name)
                 break
     if not detected:
         return "Unknown"
     named = [d for d in detected if d != "Native Shopify"]
     return " + ".join(named) if named else "Native Shopify"
 
-def safe_fetch(scraper, url, retries=2):
-    """
-    URL fetch karo. 
-    Returns: (text, status_code)
-    JSON errors pe bhi text return karo — crash mat karo.
-    """
-    for attempt in range(retries + 1):
-        try:
-            resp = scraper.get(url, timeout=TIMEOUT, allow_redirects=True)
-            if resp.status_code == 429:
-                time.sleep(5 * (attempt + 1))
-                continue
-            return resp.text, resp.status_code
-        except Exception as e:
-            if attempt == retries:
-                return "", str(e)[:60]
-            time.sleep(1)
-    return "", "max_retries"
-
 def safe_json(text):
-    """
-    Text ko JSON parse karo.
-    Returns: dict ya None — crash nahi hoga.
-    """
     try:
         return json.loads(text)
     except Exception:
         return None
 
-def get_all_products(scraper, domain):
-    """products.json paginate karo. JSON error = empty list, not crash."""
-    all_products = []
-    page = 1
-    while True:
-        text, status = safe_fetch(scraper, f"https://{domain}/products.json?limit=250&page={page}")
-        if status != 200:
-            return all_products, status
-        data = safe_json(text)
-        if data is None:
-            # JSON parse failed = Cloudflare HTML aaya
-            # Agar already kuch products hain toh return karo
-            return all_products, "cf_blocked" if not all_products else 200
-        products = data.get('products', [])
-        if not products:
-            return all_products, 200
-        all_products.extend(products)
-        if len(products) < 250:
-            return all_products, 200
-        page += 1
-        time.sleep(random.uniform(0.5, 1.5))
-    return all_products, 200
-
-def check_product_js(scraper, domain, handle):
-    text, status = safe_fetch(scraper, f"https://{domain}/products/{handle}.js")
-    if status != 200:
-        return False, None
-    data = safe_json(text)
+def extract_json_from_page(body):
+    """Browser HTML wrapper se JSON nikalo."""
+    pre = re.search(r'<pre[^>]*>(.*?)</pre>', body, re.DOTALL)
+    txt = pre.group(1) if pre else body
+    txt = txt.replace("&amp;","&").replace("&lt;","<").replace("&gt;",">").replace("&#39;","'")
+    data = safe_json(txt)
     if data is None:
-        return False, None
-    plans = data.get('selling_plan_groups', [])
-    return bool(plans), data
+        data = safe_json(body)
+    return data
 
-def scrape_store(domain):
+async def scrape_store_async(domain, pw):
     domain = str(domain).strip().lower()
     domain = domain.replace("https://","").replace("http://","").split('/')[0]
     if not domain:
-        return {"status": "skipped", "domain": domain, "rows": []}
+        return {"status":"skipped","domain":domain,"rows":[]}
 
-    scraper = make_scraper()
-    time.sleep(random.uniform(0.2, 0.8))
-
-    # ── Step 1: Homepage — app detect + CF cookie ────────────
+    browser = await pw.chromium.launch(
+        headless=True,
+        args=["--no-sandbox","--disable-setuid-sandbox","--disable-blink-features=AutomationControlled"]
+    )
+    context = await browser.new_context(
+        viewport={"width":1366,"height":768},
+        user_agent=random.choice([
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        ]),
+        locale="en-US",
+        timezone_id="America/New_York",
+    )
+    await context.add_init_script("""
+        Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+        Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3]});
+        Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
+    """)
+    page = await context.new_page()
     detected_app = "Unknown"
-    home_text, home_status = safe_fetch(scraper, f"https://{domain}")
-    if not home_text:
-        return {"status": f"blocked_{home_status}", "domain": domain, "rows": []}
-    if home_status not in [200, 301, 302]:
-        return {"status": f"blocked_{home_status}", "domain": domain, "rows": []}
-    detected_app = detect_app(home_text)
-    time.sleep(random.uniform(0.5, 1.5))
-
-    # ── Step 2: Products fetch ───────────────────────────────
-    products, api_status = get_all_products(scraper, domain)
-    total_sku = len(products)
-
-    # Agar products nahi aaye lekin app detect hua
-    if total_sku == 0:
-        if detected_app != "Unknown":
-            return {
-                "status": "app_detected_no_products",
-                "domain": domain,
-                "rows": [{
-                    "Store":            domain,
-                    "Subscription_App": detected_app,
-                    "Total_SKUs":       0,
-                    "Product_Title":    "",
-                    "Price":            "",
-                    "Sub_Plans":        "",
-                    "Product_Link":     f"https://{domain}",
-                    "Note":             f"App detected on homepage but products.json blocked ({api_status})"
-                }]
-            }
-        return {"status": f"blocked_{api_status}", "domain": domain, "rows": []}
-
-    # ── Step 3: Pre-check — pehle 3 products ────────────────
-    has_sub = False
-    for i in range(min(3, total_sku)):
-        has_plans, _ = check_product_js(scraper, domain, products[i]['handle'])
-        if has_plans:
-            has_sub = True
-            break
-
-    if not has_sub:
-        return {"status": "no_subscription", "domain": domain, "rows": []}
-
-    # ── Step 4: Poora scan ───────────────────────────────────
     store_results = []
-    for p in products:
-        try:
-            has_plans, data = check_product_js(scraper, domain, p['handle'])
-            if has_plans and data:
-                plans = data.get('selling_plan_groups', [])
-                store_results.append({
-                    "Store":            domain,
-                    "Subscription_App": detected_app,
-                    "Total_SKUs":       total_sku,
-                    "Product_Title":    data['title'],
-                    "Price":            data.get('price', 0) / 100,
-                    "Sub_Plans":        ", ".join([plan['name'] for plan in plans]),
-                    "Product_Link":     f"https://{domain}/products/{p['handle']}",
-                    "Note":             ""
-                })
-        except Exception:
-            continue
 
-    status = "found" if store_results else "no_subscription"
-    return {"status": status, "domain": domain, "rows": store_results}
+    try:
+        # Step 1: Homepage
+        await asyncio.sleep(random.uniform(0.5,1.5))
+        try:
+            resp = await page.goto(f"https://{domain}", timeout=TIMEOUT, wait_until="domcontentloaded")
+            status = resp.status if resp else 0
+            if status not in [200,301,302]:
+                return {"status":f"blocked_{status}","domain":domain,"rows":[]}
+            detected_app = detect_app(await page.content())
+        except PWTimeout:
+            return {"status":"blocked_timeout","domain":domain,"rows":[]}
+        except Exception as e:
+            return {"status":f"blocked_{str(e)[:40]}","domain":domain,"rows":[]}
+
+        await asyncio.sleep(random.uniform(0.8,1.5))
+
+        # Step 2: products.json real browser se
+        all_products = []
+        page_num = 1
+        while True:
+            try:
+                r = await page.goto(
+                    f"https://{domain}/products.json?limit=250&page={page_num}",
+                    timeout=TIMEOUT, wait_until="domcontentloaded"
+                )
+                if r and r.status == 200:
+                    data = extract_json_from_page(await page.content())
+                    if not data:
+                        break
+                    products = data.get('products', [])
+                    if not products:
+                        break
+                    all_products.extend(products)
+                    if len(products) < 250:
+                        break
+                    page_num += 1
+                    await asyncio.sleep(random.uniform(0.5,1.0))
+                elif r and r.status == 429:
+                    await asyncio.sleep(5)
+                else:
+                    break
+            except Exception:
+                break
+
+        total_sku = len(all_products)
+
+        if total_sku == 0:
+            if detected_app != "Unknown":
+                return {
+                    "status":"app_detected_no_products",
+                    "domain":domain,
+                    "rows":[{
+                        "Store":domain, "Subscription_App":detected_app,
+                        "Total_SKUs":0, "Product_Title":"", "Price":"",
+                        "Sub_Plans":"", "Product_Link":f"https://{domain}",
+                        "Note":"App on homepage, products.json blocked"
+                    }]
+                }
+            return {"status":"no_products","domain":domain,"rows":[]}
+
+        # Step 3: Pre-check 3 products
+        has_sub = False
+        for i in range(min(3, total_sku)):
+            try:
+                r = await page.goto(
+                    f"https://{domain}/products/{all_products[i]['handle']}.js",
+                    timeout=TIMEOUT, wait_until="domcontentloaded"
+                )
+                if r and r.status == 200:
+                    data = extract_json_from_page(await page.content())
+                    if data and data.get('selling_plan_groups'):
+                        has_sub = True
+                        break
+            except Exception:
+                continue
+
+        if not has_sub:
+            return {"status":"no_subscription","domain":domain,"rows":[]}
+
+        # Step 4: Full scan
+        for p in all_products:
+            try:
+                await asyncio.sleep(random.uniform(0.2,0.5))
+                r = await page.goto(
+                    f"https://{domain}/products/{p['handle']}.js",
+                    timeout=TIMEOUT, wait_until="domcontentloaded"
+                )
+                if r and r.status == 200:
+                    data = extract_json_from_page(await page.content())
+                    if data:
+                        plans = data.get('selling_plan_groups', [])
+                        if plans:
+                            store_results.append({
+                                "Store":            domain,
+                                "Subscription_App": detected_app,
+                                "Total_SKUs":       total_sku,
+                                "Product_Title":    data['title'],
+                                "Price":            data.get('price',0)/100,
+                                "Sub_Plans":        ", ".join([pl['name'] for pl in plans]),
+                                "Product_Link":     f"https://{domain}/products/{p['handle']}",
+                                "Note":             ""
+                            })
+            except Exception:
+                continue
+
+    finally:
+        await browser.close()
+
+    return {"status":"found" if store_results else "no_subscription","domain":domain,"rows":store_results}
+
+def run_store(domain):
+    async def _run():
+        async with async_playwright() as pw:
+            return await scrape_store_async(domain, pw)
+    return asyncio.run(_run())
 
 def get_url_column(df):
     for col in df.columns:
@@ -252,31 +257,31 @@ def main():
         start = CHUNK_INDEX * chunk_size
         end   = start + chunk_size if CHUNK_INDEX < CHUNK_TOTAL - 1 else len(domains)
         domains = domains[start:end]
-        print(f"🔀 Chunk {CHUNK_INDEX+1}/{CHUNK_TOTAL}: {len(domains)} stores ({start}–{end})", flush=True)
+        print(f"🔀 Chunk {CHUNK_INDEX+1}/{CHUNK_TOTAL}: {len(domains)} stores ({start}-{end})", flush=True)
 
     print(f"\n🚀 Scanning {len(domains)} stores | threads={THREADS}", flush=True)
-    print(f"🛡️  CloudScraper | ⚡ Pre-check | 🔍 App Detection\n", flush=True)
+    print(f"🌐 Playwright real browser | 🔍 App Detection | ⚡ Pre-check\n", flush=True)
 
     all_rows   = []
     status_log = []
     completed  = 0
 
     with ThreadPoolExecutor(max_workers=THREADS) as executor:
-        futures = {executor.submit(scrape_store, d): d for d in domains}
+        futures = {executor.submit(run_store, d): d for d in domains}
         with tqdm(total=len(domains), dynamic_ncols=True) as pbar:
-            for future in as_completed(futures, timeout=36000):
+            for future in as_completed(futures, timeout=72000):
                 try:
-                    r = future.result(timeout=90)
-                    status_log.append({"Domain": r["domain"], "Status": r["status"]})
+                    r = future.result(timeout=120)
+                    status_log.append({"Domain":r["domain"],"Status":r["status"]})
                     if r["rows"]:
                         all_rows.extend(r["rows"])
                 except Exception:
                     domain = futures[future]
-                    status_log.append({"Domain": str(domain), "Status": "timeout"})
+                    status_log.append({"Domain":str(domain),"Status":"timeout"})
                 completed += 1
                 pbar.update(1)
                 if completed % 50 == 0:
-                    found   = sum(1 for s in status_log if s["Status"] in ["found", "app_detected_no_products"])
+                    found   = sum(1 for s in status_log if s["Status"] in ["found","app_detected_no_products"])
                     blocked = sum(1 for s in status_log if "blocked" in s["Status"])
                     tqdm.write(f"[{completed}/{len(domains)}] ✅ Found: {found} | ❌ Blocked: {blocked}")
 
@@ -288,7 +293,6 @@ def main():
         if all_rows:
             df_detail = pd.DataFrame(all_rows)
             df_detail.to_excel(writer, sheet_name="Subscription_Products", index=False)
-
             summary = []
             for store, grp in df_detail.groupby("Store"):
                 summary.append({
@@ -301,11 +305,9 @@ def main():
                     "Product_Names":         " | ".join(grp["Product_Title"].tolist()[:10])
                 })
             pd.DataFrame(summary).to_excel(writer, sheet_name="Store_Summary", index=False)
-
             app_counts = df_detail["Subscription_App"].value_counts().reset_index()
-            app_counts.columns = ["App", "Count"]
+            app_counts.columns = ["App","Count"]
             app_counts.to_excel(writer, sheet_name="App_Usage", index=False)
-
         df_log.to_excel(writer, sheet_name="Status_Log", index=False)
 
     print(f"\n✅ Saved: {OUTPUT_FILE}", flush=True)
